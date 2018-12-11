@@ -18,38 +18,34 @@ namespace pangolin
 class RandomFile
 {
 public:
-    RandomFile(const std::string& filename, size_t preallocated_size_bytes=0)
-        :should_run(true)
+    enum class GetPolicy
     {
-        std::error_code err;
+        Throw,
+        Grow,
+        Wait
+    };
 
-        file.open(filename, std::ios_base::binary);
-        fd = mio::detail::open_file(filename, mio::access_mode::write, err);
-        if(err) throw std::runtime_error(err.message());
+    RandomFile(const RandomFile&) = delete;
 
-        file_size_bytes = mio::detail::query_file_size(fd,err);
-        if(err) throw std::runtime_error(err.message());
-
-        data_size_bytes = file_size_bytes;
-
-        // Make sure we have some room for growth without fragmentation
-        if(file_size_bytes < preallocated_size_bytes) {
-            Truncate(preallocated_size_bytes);
+    RandomFile(const std::string& filename)
+        : filename(filename), should_run(true), fd(mio::invalid_handle)
+    {
+        if(FileExists(filename)) {
+            write_thread = std::thread(&RandomFile::WriteThread, this);
+        }else{
+            throw std::runtime_error("No such file");
         }
-
-        file.seekg(0, std::ios_base::beg);
-        write_thread = std::thread(&RandomFile::WriteThread, this);
     }
 
     ~RandomFile()
     {
         should_run = false;
+        queue_cond.notify_all();
         write_thread.join();
-        Truncate(data_size_bytes);
     }
 
     // Atomically stream to file (and jump the queue)
-    void Write(const std::function<void(std::ostream&)>& func)
+    void Append(const std::function<void(std::ostream&)>& func)
     {
         std::unique_lock<std::mutex> l(write_mutex);
         func(file);
@@ -59,55 +55,111 @@ public:
     {
         std::unique_lock<std::mutex> lq(queue_mutex);
         to_write.emplace([data, size_bytes, this](){
-            std::unique_lock<std::mutex> lw(write_mutex);
-            Write(data.get(), size_bytes);
+            DirectWrite(data.get(), size_bytes);
         });
-        cond.notify_all();
+        queue_cond.notify_one();
     }
 
-private:
-    void Write(uint8_t* data, size_t size_bytes)
+    std::shared_ptr<uint8_t>
+    Get(size_t offset_bytes, size_t size_bytes, GetPolicy policy = GetPolicy::Throw)
     {
+        if(!mmap || mmap->size() < size_bytes) {
+            std::error_code err;
+
+            fd = mio::detail::open_file(filename, mio::access_mode::write, err);
+            if(err) throw std::runtime_error(err.message());
+
+            size_t file_size = mio::detail::query_file_size(fd, err);
+            if(err) throw std::runtime_error(err.message());
+
+            if(offset_bytes + size_bytes > file_size) {
+                std::unique_lock<std::mutex> lw(write_mutex);
+
+                // Can't map this right now
+                if(policy == GetPolicy::Throw) {
+                    throw std::runtime_error("Get() called out of allocated file size.");
+                }else if(policy == GetPolicy::Wait) {
+                    while(offset_bytes + size_bytes > file_size) {
+                        write_cond.wait(lw);
+                        file_size = mio::detail::query_file_size(fd, err);
+                        if(err) throw std::runtime_error(err.message());
+                        std::cout << file_size << std::endl;
+                    }
+                }else if(policy == GetPolicy::Grow){
+                    const size_t new_size_bytes = offset_bytes + size_bytes;
+                    Truncate(new_size_bytes, err);
+                    if(err) throw std::runtime_error(err.message());
+                    file.seekp(new_size_bytes, std::ios_base::beg);
+                }
+            }
+
+            // We either don't have a mapping yet or it is partially mapped only
+            if(offset_bytes + size_bytes < bytes_written) {
+                // Create a new mmap.
+                // The old will be freed when it is no longer references
+                mmap = std::make_shared<mio::ummap_sink>();
+                mmap->map(fd, 0, mio::map_entire_file, err);
+                if(err) throw std::runtime_error(err.message());
+            }
+        }
+
+        uint8_t* user_ptr =  mmap->data() + offset_bytes;
+        return std::shared_ptr<uint8_t>(mmap, user_ptr);
+    }
+
+private:   
+    void DirectWrite(uint8_t* data, size_t size_bytes)
+    {
+        std::unique_lock<std::mutex> lw(write_mutex);
         file.write((char*)data, size_bytes);
+        bytes_written += size_bytes;
+        write_cond.notify_one();
+    }
+
+    void Truncate(size_t size_bytes, std::error_code& )
+    {
+        ftruncate(fd, size_bytes);
     }
 
     void WriteThread()
-    {
+    {       
+        file.open(filename, std::ios_base::binary);
+
         while(true)
         {
             while(should_run && to_write.empty()) {
                 std::unique_lock<std::mutex> lq(queue_mutex);
-                cond.wait(lq);
+                queue_cond.wait(lq);
             }
 
-            if(should_run) {
+            if(!to_write.empty()) {
+                // Execute the functor at the front of the queue
                 to_write.front()();
-                {
-                    std::unique_lock<std::mutex> lq(queue_mutex);
-                    to_write.pop();
-                }
+                std::unique_lock<std::mutex> lq(queue_mutex);
+                to_write.pop();
+            }else if(!should_run) {
+                break;
             }
         }
     }
 
-    void Truncate(size_t size_bytes)
-    {
-        ftruncate(fd, size_bytes);
-        file_size_bytes = size_bytes;
-        data_size_bytes = std::min(data_size_bytes, size_bytes);
-    }
-
+    std::string filename;
     volatile bool should_run;
     std::thread write_thread;
 
-    std::condition_variable cond;
+    std::condition_variable queue_cond;
+    std::condition_variable write_cond;
     std::mutex queue_mutex;
     std::mutex write_mutex;
-    std::fstream file;
-    mio::file_handle_type fd;
-    size_t data_size_bytes;
-    size_t file_size_bytes;
+
+    std::ofstream file;
+    size_t bytes_written;
+    size_t bytes_queued;
     std::queue<std::function<void(void)>> to_write;
+
+    // Seperate file descriptor for memory mapped reading.
+    mio::file_handle_type fd;
+    std::shared_ptr<mio::ummap_sink> mmap;
 };
 
 }
